@@ -9,6 +9,7 @@ import re
 import typing
 import unicodedata
 
+import numpy as np
 from scipy import sparse
 
 from river import base, utils
@@ -222,13 +223,37 @@ class VectorizerMixin:
             x = step(x)
         return x
 
+    def _count_matrix(self, X):
+        """Build a (n_documents, n_terms) CSR count matrix from a mini-batch.
+
+        Returns the CSR matrix, the ordered list of terms (columns), and the
+        pandas index of ``X``. When ``on`` is set, ``X`` is a ``DataFrame`` and
+        each row is processed as a record; otherwise ``X`` is a ``Series`` of
+        strings.
+        """
+        docs = X.to_dict(orient="records") if self.on is not None else X
+        indptr = [0]
+        indices: list[int] = []
+        data: list[int] = []
+        index: dict = {}
+        for doc in docs:
+            for term, count in collections.Counter(self.process_text(doc)).items():
+                indices.append(index.setdefault(term, len(index)))
+                data.append(count)
+            indptr.append(len(data))
+        counts = sparse.csr_matrix(
+            (data, indices, indptr),
+            shape=(len(indptr) - 1, len(index)),
+        )
+        return counts, list(index), X.index
+
     def _more_tags(self):
         if self.on is None:
             return {base.tags.TEXT_INPUT}
         return {}
 
 
-class BagOfWords(base.Transformer, VectorizerMixin):
+class BagOfWords(base.MiniBatchTransformer, VectorizerMixin):
     """Counts tokens in sentences.
 
     This transformer can be used to counts tokens in a given piece of text. It takes care of
@@ -341,28 +366,11 @@ class BagOfWords(base.Transformer, VectorizerMixin):
     def transform_one(self, x):
         return dict(collections.Counter(self.process_text(x)))
 
-    def transform_many(self, X: pd.Series) -> pd.DataFrame:
-        """Transform pandas series of string into term-frequency pandas sparse dataframe."""
+    def transform_many(self, X: pd.Series | pd.DataFrame) -> pd.DataFrame:
+        """Transform a mini-batch of text into a term-frequency sparse dataframe."""
         pd = utils.pandas.import_pandas()
-        indptr, indices, data = [0], [], []
-        index: dict[int, int] = {}
-
-        for d in X:
-            t: int
-            for t, f in collections.Counter(self.process_text(d)).items():
-                indices.append(index.setdefault(t, len(index)))
-                data.append(f)
-
-            indptr.append(len(data))
-
-        return pd.DataFrame.sparse.from_spmatrix(
-            sparse.csr_matrix((data, indices, indptr)),
-            index=X.index,
-            columns=index.keys(),
-        )
-
-    def learn_many(self, X):
-        return
+        counts, columns, index = self._count_matrix(X)
+        return pd.DataFrame.sparse.from_spmatrix(counts, index=index, columns=columns)
 
 
 class TFIDF(BagOfWords):
@@ -445,6 +453,20 @@ class TFIDF(BagOfWords):
     {'and': 0.497, 'this': 0.293, 'is': 0.293, 'the': 0.293, 'third': 0.497, 'one': 0.497}
     {'is': 0.384, 'this': 0.384, 'the': 0.384, 'first': 0.580, 'document': 0.469}
 
+    `TFIDF` also supports mini-batches via `learn_many` and `transform_many`:
+
+    >>> import pandas as pd
+    >>> tfidf = feature_extraction.TFIDF()
+    >>> X = pd.Series([
+    ...     'This is the first document.',
+    ...     'This document is the second document.',
+    ... ], index=['a', 'b'])
+    >>> tfidf.learn_many(X)
+    >>> tfidf.transform_many(X)
+           this     is    the  first  document  second
+    a  0.409  0.409  0.409  0.575     0.409       0
+    b  0.334  0.334  0.334      0     0.667   0.469
+
     """
 
     def __init__(
@@ -497,11 +519,30 @@ class TFIDF(BagOfWords):
             return {term: tfidf / norm for term, tfidf in tfidfs.items()}
         return tfidfs
 
-    # Mini-batch methods should be done well™ and not just be a loop over the *_one equivalent.
-    def learn_many(self, X):
-        "Not available, will raise an exception."
-        raise NotImplementedError
+    def learn_many(self, X: pd.Series | pd.DataFrame) -> None:
+        docs = X.to_dict(orient="records") if self.on is not None else X
+        for doc in docs:
+            self.dfs.update(set(self.process_text(doc)))
+        self.n += len(X)
 
-    def transform_many(self, X):
-        "Not available, will raise an exception."
-        raise NotImplementedError
+    def transform_many(self, X: pd.Series | pd.DataFrame) -> pd.DataFrame:
+        """Transform a mini-batch of text into a TF-IDF sparse dataframe."""
+        pd = utils.pandas.import_pandas()
+        counts, columns, index = self._count_matrix(X)
+
+        # Term frequency: divide each document (row) by its total token count.
+        n_terms = np.asarray(counts.sum(axis=1)).ravel().astype(float)
+        inv_n_terms = np.divide(1.0, n_terms, out=np.zeros_like(n_terms), where=n_terms != 0)
+        tfidf = sparse.diags(inv_n_terms) @ counts
+
+        # Inverse document frequency from the current online state.
+        dfs = np.array([self.dfs[term] for term in columns], dtype=float)
+        idf = np.log((1 + self.n) / (1 + dfs)) + 1
+        tfidf = tfidf @ sparse.diags(idf)
+
+        if self.normalize:
+            norms = np.sqrt(np.asarray(tfidf.multiply(tfidf).sum(axis=1)).ravel())
+            inv_norms = np.divide(1.0, norms, out=np.zeros_like(norms), where=norms != 0)
+            tfidf = sparse.diags(inv_norms) @ tfidf
+
+        return pd.DataFrame.sparse.from_spmatrix(tfidf.tocsr(), index=index, columns=columns)
