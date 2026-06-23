@@ -228,7 +228,7 @@ class VectorizerMixin:
         return {}
 
 
-class BagOfWords(base.Transformer, VectorizerMixin):
+class BagOfWords(base.MiniBatchTransformer, VectorizerMixin):
     """Counts tokens in sentences.
 
     This transformer can be used to counts tokens in a given piece of text. It takes care of
@@ -341,28 +341,22 @@ class BagOfWords(base.Transformer, VectorizerMixin):
     def transform_one(self, x):
         return dict(collections.Counter(self.process_text(x)))
 
-    def transform_many(self, X: pd.Series) -> pd.DataFrame:
-        """Transform pandas series of string into term-frequency pandas sparse dataframe."""
+    def transform_many(self, X: pd.Series | pd.DataFrame) -> pd.DataFrame:
+        """Transform a mini-batch of text into a term-frequency sparse dataframe."""
         pd = utils.pandas.import_pandas()
+        docs = X.to_dict(orient="records") if self.on is not None else X
         indptr, indices, data = [0], [], []
-        index: dict[int, int] = {}
-
-        for d in X:
-            t: int
-            for t, f in collections.Counter(self.process_text(d)).items():
-                indices.append(index.setdefault(t, len(index)))
-                data.append(f)
-
+        index: dict = {}
+        for doc in docs:
+            for term, count in collections.Counter(self.process_text(doc)).items():
+                indices.append(index.setdefault(term, len(index)))
+                data.append(count)
             indptr.append(len(data))
-
         return pd.DataFrame.sparse.from_spmatrix(
-            sparse.csr_matrix((data, indices, indptr)),
+            sparse.csr_matrix((data, indices, indptr), shape=(len(indptr) - 1, len(index))),
             index=X.index,
-            columns=index.keys(),
+            columns=list(index),
         )
-
-    def learn_many(self, X):
-        return
 
 
 class TFIDF(BagOfWords):
@@ -445,6 +439,20 @@ class TFIDF(BagOfWords):
     {'and': 0.497, 'this': 0.293, 'is': 0.293, 'the': 0.293, 'third': 0.497, 'one': 0.497}
     {'is': 0.384, 'this': 0.384, 'the': 0.384, 'first': 0.580, 'document': 0.469}
 
+    `TFIDF` also supports mini-batches via `learn_many` and `transform_many`:
+
+    >>> import pandas as pd
+    >>> tfidf = feature_extraction.TFIDF()
+    >>> X = pd.Series([
+    ...     'This is the first document.',
+    ...     'This document is the second document.',
+    ... ], index=['a', 'b'])
+    >>> tfidf.learn_many(X)
+    >>> tfidf.transform_many(X)
+           this     is    the  first  document  second
+    a  0.409  0.409  0.409  0.575     0.409       0
+    b  0.334  0.334  0.334      0     0.667   0.469
+
     """
 
     def __init__(
@@ -497,11 +505,24 @@ class TFIDF(BagOfWords):
             return {term: tfidf / norm for term, tfidf in tfidfs.items()}
         return tfidfs
 
-    # Mini-batch methods should be done well™ and not just be a loop over the *_one equivalent.
-    def learn_many(self, X):
-        "Not available, will raise an exception."
-        raise NotImplementedError
+    def learn_many(self, X: pd.Series | pd.DataFrame) -> None:
+        docs = X.to_dict(orient="records") if self.on is not None else X
+        for doc in docs:
+            self.learn_one(doc)
 
-    def transform_many(self, X):
-        "Not available, will raise an exception."
-        raise NotImplementedError
+    def transform_many(self, X: pd.Series | pd.DataFrame) -> pd.DataFrame:
+        """Transform a mini-batch of text into a TF-IDF sparse dataframe."""
+        pd = utils.pandas.import_pandas()
+        docs = X.to_dict(orient="records") if self.on is not None else X
+        indptr, indices, data = [0], [], []
+        index: dict = {}
+        for doc in docs:
+            for term, weight in self.transform_one(doc).items():
+                indices.append(index.setdefault(term, len(index)))
+                data.append(weight)
+            indptr.append(len(data))
+        return pd.DataFrame.sparse.from_spmatrix(
+            sparse.csr_matrix((data, indices, indptr), shape=(len(indptr) - 1, len(index))),
+            index=X.index,
+            columns=list(index),
+        )
