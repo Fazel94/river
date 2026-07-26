@@ -13,6 +13,7 @@
 ## anomaly
 
 - Added `anomaly.LODA`, an online implementation of Pevný's *Lightweight on-line detector of anomalies*. It maintains an ensemble of one-dimensional `sketch.Histogram`s over sparse random projections and scores samples by their average negative log-likelihood.
+- Rewrote `anomaly.LocalOutlierFactor`. It now stores samples in a bounded sliding window via a `river.neighbors` search engine (`LazySearch` by default, `SWINN` for approximate search) and computes the LOF of a sample against the window on demand. `learn_one` is now constant-time and memory is bounded by the window size, and `score_one` no longer mutates the model. Scores match scikit-learn over the same window: an unseen point reproduces `LocalOutlierFactor(novelty=True)`, and a stored point reproduces the in-sample `negative_outlier_factor_` (a point is never its own neighbor). `learn_many` now accepts any [narwhals](https://github.com/narwhals-dev/narwhals)-supported eager dataframe (pandas, polars, pyarrow, ...). Behavior changes: scores now reflect the most recent `window_size` samples rather than the entire history, scoring an already-seen point returns its LOF instead of `0.0`, and the `distance_func` parameter is replaced by the engine's distance function.
 
 - Made `anomaly.OneClassSVM.learn_many` dataframe-agnostic via narwhals: it now accepts any narwhals-supported eager backend (pandas, polars, pyarrow, ...) instead of only pandas. Outputs are unchanged.
 
@@ -23,10 +24,15 @@
 
 ## compose
 
+- The mini-batch methods of `compose.Pipeline`, `compose.TransformerUnion`, `compose.Select`, and `compose.TransformerProduct` now accept and return any [narwhals](https://github.com/narwhals-dev/narwhals)-supported eager backend (pandas, polars, pyarrow, ...) instead of being pandas-only, so a whole pipeline can be mini-batched on a non-pandas backend. The input backend is preserved on output, including the pandas index, and `pandas` is no longer required unless the input is a pandas frame. `TransformerProduct` keeps the pandas `Sparse[uint8]` fast path when crossing one-hot encoded features.
 - `compose.Pipeline` now forwards extra keyword arguments (such as the timestamp `t` used by `utils.TimeRolling`, or a sample weight `w`) to each step whose method declares them, and drops them for steps that don't. This makes `feature_extraction.Agg`/`TargetAgg` backed by `utils.TimeRolling` work inside a pipeline via `model.learn_one(x, y, t=t)`. Routing applies to `learn_one` and to the predict-time methods (`predict_one`, `predict_proba_one`, `score_one`, `transform_one`), so it also works under `compose.learn_during_predict` where unsupervised steps learn during `predict_one(x, t=t)`. Fixes [#1600](https://github.com/online-ml/river/issues/1600). The accepted arguments are determined once when the pipeline plan is built, so pipelines with no extra arguments keep their previous speed.
+- Fixed `compose.Pipeline.transform_many` fitting the final unsupervised transformer on the data being transformed when `learn_during_predict` is off (a `not` was inverted relative to the single-instance `transform_one` and to the intermediate steps). `transform_many` no longer mutates the model outside `learn_during_predict`, and it now agrees with `transform_one` instead of double-learning the final step.
 
 ## covariance
 
+- Added `EwaCovariance`, `LedoitWolfCovariance`, `OASCovariance`, and `ShrunkCovariance`: online covariance estimators for non-stationary streams (exponentially weighted, recency-biased) and high-dimensional / few-sample regimes (shrinkage towards a well-conditioned target). They are dict-native like `EmpiricalCovariance` and support mini-batches via `update_many` on any [narwhals](https://github.com/narwhals-dev/narwhals)-supported eager backend.
+- Added `EwaPrecision`, an exponentially weighted precision (inverse covariance) matrix maintained online via a forgetting-factor Sherman-Morrison update. The recency-weighted counterpart of `EmpiricalPrecision`, useful for tracking Mahalanobis distances and Gaussian likelihoods on non-stationary streams.
+- `EmpiricalCovariance.update_many` and `EmpiricalPrecision.update_many` now accept any [narwhals](https://github.com/narwhals-dev/narwhals)-supported eager dataframe (pandas, polars, pyarrow, ...) instead of pandas only. Outputs are unchanged for the pandas path.
 - Added weighted sample support to `EmpiricalCovariance.update` and `EmpiricalCovariance.revert` by accepting an optional `w` parameter and propagating it to the underlying `stats.Cov` and `stats.Var` statistics.
 - Sped up `EmpiricalCovariance.update`/`revert` (~40% faster at 30 features) by caching the sorted feature list and pair iteration in the hot path. No semantic change.
 - Restructured `EmpiricalPrecision` around NumPy-backed dense state, removing the per-update dict ↔ numpy marshalling. ~7× faster on 2000 × 20 sample streams.
@@ -36,6 +42,7 @@
 
 - Added `datasets.CriteoAds`, a 100,000-row sample of the Criteo Display Advertising Challenge (binary click prediction with 13 integer and 26 high-cardinality categorical features). A natural fit for one-hot models such as `linear_model.AdPredictor`.
 - Added `datasets.Shuttle`, the UCI Statlog (Shuttle) dataset cast as a binary anomaly-detection task following the ODDS benchmark (49,097 observations, 9 numerical features, ~7% anomalies). Ships bundled with River.
+- Added `datasets.SP500Stocks`, daily returns (1,257 trading days, 2013-2018) for ten large-cap S&P 500 stocks across diverse sectors. A natural fit for the online covariance estimators in `river.covariance`.
 
 ## facto
 
@@ -58,6 +65,11 @@
 - `linear_model.LinearRegression` and `linear_model.LogisticRegression` mini-batch methods (`learn_many`, `predict_many`, `predict_proba_many`) now accept and return any [narwhals](https://github.com/narwhals-dev/narwhals)-supported eager backend (pandas, polars, pyarrow, ...) instead of being pandas-only. The input backend is preserved on output, including the pandas index. These methods no longer require `pandas` to be installed.
 - `linear_model.BayesianLinearRegression` is now a `MiniBatchRegressor`: it gained a `learn_many` method, equivalent to looping `learn_one` over the rows (exact without smoothing, and the matching closed-form geometric weighting with smoothing). Its `learn_many`/`predict_many` accept and return any [narwhals](https://github.com/narwhals-dev/narwhals)-supported eager backend (pandas, polars, pyarrow, ...), preserving the input backend and pandas index, and no longer require `pandas`.
 
+## metrics
+
+- Fixed `metrics.base.Metrics` (a metrics collection, built via `metric_a + metric_b`) dropping the sample weight `w`: `update` now forwards `w` to each child metric, so weighted metrics report correct values inside a collection and `update`/`revert` cancel exactly. Previously `revert` applied the weight but `update` ignored it.
+- Fixed `metrics.BalancedAccuracy` deflating its score when a label appears in the predictions but never as a ground-truth label. Such a class has no support, so its recall is undefined and must be excluded from the per-class average; previously it was counted as `0` and inflated the denominator, disagreeing with `sklearn.metrics.balanced_accuracy_score`. `BalancedAccuracy` is now covered by the scikit-learn equivalence test.
+
 ## multiclass
 
 - `multiclass.OneVsRestClassifier` mini-batch methods (`learn_many`, `predict_many`, `predict_proba_many`) now accept and return any [narwhals](https://github.com/narwhals-dev/narwhals)-supported eager backend (pandas, polars, pyarrow, ...) instead of being pandas-only. The input backend is preserved on output, including the pandas index, and these methods no longer require `pandas` to be installed. Outputs are unchanged on the pandas path.
@@ -73,6 +85,7 @@
 
 ## neighbors
 
+- Fixed the Euclidean fast path of `neighbors.LazySearch`, which returned the *farthest* candidates instead of the nearest because its search heap was keyed on the negated distance. This affected `KNNClassifier`, `KNNRegressor`, and `LocalOutlierFactor` whenever they ran over a `LazySearch` engine with the default Euclidean distance.
 - Gave the SWINN graph `Vertex` `__slots__` and dropped its `base.Base` inheritance (it is an internal graph node, not an estimator). One vertex is created per buffered sample, so this trims memory on large `neighbors.SWINN` indexes; behavior is unchanged.
 
 ## neural_net
@@ -89,15 +102,19 @@
 
 ## preprocessing
 
+- Added `preprocessing.GapEncoder`, an online Gamma-Poisson factorization of character n-gram counts for embedding fuzzy/dirty string categories (the streaming counterpart of skrub's `GapEncoder`). The vocabulary and topics grow as new strings arrive, and `transform_one` is read-only. Closes [#1439](https://github.com/online-ml/river/issues/1439).
 - Added a `window_size` parameter to `preprocessing.StandardScaler`, `preprocessing.MinMaxScaler`, and `preprocessing.MaxAbsScaler`. When set, the scaler tracks its statistics over the last `window_size` observations instead of the whole stream.
 - Added a `_from_state` classmethod to `preprocessing.MinMaxScaler`, `preprocessing.MaxAbsScaler`, and `preprocessing.StandardScaler` so a scaler can be warm-started from precomputed statistics without replaying past observations.
 - `preprocessing.FeatureHasher` now hashes with MurmurHash3 in Rust, making it much faster. It gains an `alternate_sign` parameter (default `True`, matching scikit-learn) and returns a plain `dict`. Hashed feature indices differ from previous versions.
 - `preprocessing.OneHotEncoder` mini-batch methods (`learn_many`, `transform_many`) now accept and return any [narwhals](https://github.com/narwhals-dev/narwhals)-supported eager backend (pandas, polars, pyarrow, ...) instead of being pandas-only, preserving the input backend (including the pandas index) on output. The pandas path keeps returning `Sparse[uint8]` columns; other backends return dense integer columns, as they have no sparse-array equivalent. `transform_many` only requires `pandas` when the input is a pandas frame.
 - `preprocessing.OrdinalEncoder` mini-batch methods (`learn_many`, `predict_many`, `predict_proba_many`) now accept and return any [narwhals](https://github.com/narwhals-dev/narwhals)-supported eager backend (pandas, polars, pyarrow, ...) instead of being pandas-only. The input backend is preserved on output, including the pandas index. These methods no longer require `pandas` to be installed.
+- Fixed `preprocessing.PreviousImputer.transform_one` mutating the caller's dictionary in place: it now copies the features before filling missing values, like `StatImputer` does. Transformers are supposed to be pure, and the mutation was visible to other branches of a `compose.TransformerUnion` fed the same dict.
+- `preprocessing.StandardScaler` mini-batch methods (`learn_many`, `transform_many`) now accept and return any [narwhals](https://github.com/narwhals-dev/narwhals)-supported eager backend (pandas, polars, pyarrow, ...) instead of being pandas-only, preserving the input backend (including the pandas index) on output. Classic numpy-backed pandas keeps the historical fast path (and its float dtype, e.g. `float32`); other backends are scaled through a `float64` path. `transform_many` only requires `pandas` when the input is a pandas frame. Outputs are unchanged on the pandas path.
 
 ## proba
 
 - Added weighted sample support to `MultivariateGaussian.update` and `MultivariateGaussian.revert` by accepting an optional `w` parameter and propagating it to the underlying `EmpiricalCovariance` instance.
+- Fixed `Beta.n_samples` returning the negative of the observed-sample count (the two operands of the difference were transposed), so it now returns a non-negative count consistent with the other `proba` distributions.
 
 ## reco
 
@@ -122,6 +139,7 @@
 
 ## stats
 
+- Added `stats.EWCov`, an exponentially weighted covariance between two variables (the bivariate counterpart of `stats.EWVar`).
 - Added `stats.ChiSquared`, a streaming Chi-squared statistic between two categorical variables. Wrap it with `utils.Rolling` for a rolling version.
 
 ## tree
